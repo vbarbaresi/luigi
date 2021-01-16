@@ -19,7 +19,9 @@ import os
 import tempfile
 import logging
 import datetime
+from pkg_resources import parse_version
 
+import azure.storage.blob
 from azure.storage.blob import blockblobservice
 
 from luigi.format import get_default_format
@@ -68,15 +70,27 @@ class AzureBlobClient(FileSystem):
 
     @property
     def connection(self):
-        return blockblobservice.BlockBlobService(account_name=self.options.get("account_name"),
-                                                 account_key=self.options.get("account_key"),
-                                                 sas_token=self.options.get("sas_token"),
-                                                 protocol=self.kwargs.get("protocol"),
-                                                 connection_string=self.kwargs.get("connection_string"),
-                                                 endpoint_suffix=self.kwargs.get("endpoint_suffix"),
-                                                 custom_domain=self.kwargs.get("custom_domain"),
-                                                 is_emulated=self.kwargs.get("is_emulated", False),
-                                                 token_credential=self.kwargs.get("token_credential"))
+        kwargs = dict(
+            account_name=self.options.get("account_name"),
+            account_key=self.options.get("account_key"),
+            sas_token=self.options.get("sas_token"),
+            protocol=self.kwargs.get("protocol"),
+            connection_string=self.kwargs.get("connection_string"),
+            endpoint_suffix=self.kwargs.get("endpoint_suffix"),
+            custom_domain=self.kwargs.get("custom_domain"),
+            is_emulated=self.kwargs.get("is_emulated", False),
+        )
+        # Keeping compatibility with the previous Azure Blob package that didn't support token_credential argument
+        try:
+            # Test if we are on azure-storage-blob>=2.1.0
+            new_azure_package = parse_version(azure.storage.blob.__version__) >= parse_version("2.1.0")
+        except AttributeError:
+            # __version__ attribute doesn't even exist on azure-storage<=0.36
+            new_azure_package = False
+
+        if new_azure_package:
+            kwargs["token_credential"] = self.kwargs.get("token_credential")
+        return blockblobservice.BlockBlobService(**kwargs)
 
     def upload(self, tmp_path, container, blob, **kwargs):
         logging.debug("Uploading file '{tmp_path}' to container '{container}' and blob '{blob}'".format(
