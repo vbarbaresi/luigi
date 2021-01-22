@@ -550,7 +550,8 @@ class _DatetimeParameterBase(Parameter):
         dt = dt.replace(microsecond=0)  # remove microseconds, to avoid float rounding issues.
         delta = (dt - self.start).total_seconds()
         granularity = (self._timedelta * self.interval).total_seconds()
-        return dt - datetime.timedelta(seconds=delta % granularity)
+        # Mortar patch: remove clamping to the previous hour, preserve legacy behavior
+        return dt  # - datetime.timedelta(seconds=delta % granularity)
 
     def next_in_enumeration(self, value):
         return value + self._timedelta * self.interval
@@ -707,6 +708,13 @@ class BoolParameter(Parameter):
         else:
             raise ValueError("unknown parsing value '{}'".format(self.parsing))
         return parser_kwargs
+
+
+# Mortar compatibility
+class BooleanParameter(BoolParameter):
+
+    def __init__(self, *args, **kwargs):
+        super(BooleanParameter, self).__init__(*args, **kwargs)
 
 
 class DateIntervalParameter(Parameter):

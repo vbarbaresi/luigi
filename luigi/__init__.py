@@ -36,7 +36,7 @@ from luigi.parameter import (
     Parameter,
     DateParameter, MonthParameter, YearParameter, DateHourParameter, DateMinuteParameter, DateSecondParameter,
     DateIntervalParameter, TimeDeltaParameter,
-    IntParameter, FloatParameter, BoolParameter,
+    IntParameter, FloatParameter, BoolParameter,  BooleanParameter,
     TaskParameter, EnumParameter, DictParameter, ListParameter, TupleParameter,
     NumericalParameter, ChoiceParameter, OptionalParameter
 )
@@ -57,7 +57,7 @@ __all__ = [
     'RPCError', 'parameter', 'Parameter', 'DateParameter', 'MonthParameter',
     'YearParameter', 'DateHourParameter', 'DateMinuteParameter', 'DateSecondParameter',
     'DateIntervalParameter', 'TimeDeltaParameter', 'IntParameter',
-    'FloatParameter', 'BoolParameter', 'TaskParameter',
+    'FloatParameter', 'BoolParameter', 'BooleanParameter', 'TaskParameter',
     'ListParameter', 'TupleParameter', 'EnumParameter', 'DictParameter',
     'configuration', 'interface', 'local_target', 'run', 'build', 'event', 'Event',
     'NumericalParameter', 'ChoiceParameter', 'OptionalParameter', 'LuigiStatusCode',

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 #
 # Copyright 2015 Twitter Inc
+# Modifications copyright 2018 Datadog Inc
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,23 +24,18 @@ import mimetypes
 import os
 import tempfile
 import time
-from urllib.parse import urlsplit
-from io import BytesIO
+try:
+    from urlparse import urlsplit
+except ImportError:
+    from urllib.parse import urlsplit
 
-from tenacity import retry
-from tenacity import retry_if_exception
-from tenacity import retry_if_exception_type
-from tenacity import wait_exponential
-from tenacity import stop_after_attempt
-from tenacity import after_log
 from luigi.contrib import gcp
+from luigi.contrib.utils import _DeleteOnCloseFile
+from luigi.util import retry_with_backoff_gcs
 import luigi.target
-from luigi.format import FileWrapper
+from luigi import six
 
 logger = logging.getLogger('luigi-interface')
-
-# Retry when following errors happened
-RETRYABLE_ERRORS = None
 
 try:
     import httplib2
@@ -48,53 +44,20 @@ try:
     from googleapiclient import discovery
     from googleapiclient import http
 except ImportError:
-    logger.warning("Loading GCS module without the python packages googleapiclient & google-auth. \
+    logger.warning("Loading GCS module without the python packages googleapiclient & oauth2client. \
         This will crash at runtime if GCS functionality is used.")
 else:
+    # Retry transport and file IO errors.
     RETRYABLE_ERRORS = (httplib2.HttpLib2Error, IOError)
+
+# Number of times to retry failed downloads.
+NUM_RETRIES = 5
 
 # Number of bytes to send/receive in each request.
 CHUNKSIZE = 10 * 1024 * 1024
 
 # Mimetype to use if one can't be guessed from the file extension.
 DEFAULT_MIMETYPE = 'application/octet-stream'
-
-# Time to sleep while waiting for eventual consistency to finish.
-EVENTUAL_CONSISTENCY_SLEEP_INTERVAL = 0.1
-
-# Maximum number of sleeps for eventual consistency.
-EVENTUAL_CONSISTENCY_MAX_SLEEPS = 300
-
-# Uri for batch requests
-GCS_BATCH_URI = 'https://storage.googleapis.com/batch/storage/v1'
-
-
-# Retry configurations. For more details, see https://tenacity.readthedocs.io/en/latest/
-def is_error_5xx(err):
-    return isinstance(err, errors.HttpError) and err.resp.status >= 500
-
-
-gcs_retry = retry(retry=(retry_if_exception(is_error_5xx) | retry_if_exception_type(RETRYABLE_ERRORS)),
-                  wait=wait_exponential(multiplier=1, min=1, max=10),
-                  stop=stop_after_attempt(5),
-                  reraise=True,
-                  after=after_log(logger, logging.WARNING))
-
-
-def _wait_for_consistency(checker):
-    """Eventual consistency: wait until GCS reports something is true.
-
-    This is necessary for e.g. create/delete where the operation might return,
-    but won't be reflected for a bit.
-    """
-    for _ in range(EVENTUAL_CONSISTENCY_MAX_SLEEPS):
-        if checker():
-            return
-
-        time.sleep(EVENTUAL_CONSISTENCY_SLEEP_INTERVAL)
-
-    logger.warning('Exceeded wait for eventual GCS consistency - this may be a'
-                   'bug in the library or something is terribly wrong.')
 
 
 class InvalidDeleteException(luigi.target.FileSystemException):
@@ -106,9 +69,9 @@ class GCSClient(luigi.target.FileSystem):
 
        There are several ways to use this class. By default it will use the app
        default credentials, as described at https://developers.google.com/identity/protocols/application-default-credentials .
-       Alternatively, you may pass an google-auth credentials object. e.g. to use a service account::
+       Alternatively, you may pass an oauth2client credentials object. e.g. to use a service account::
 
-         credentials = google.auth.jwt.Credentials.from_service_account_info(
+         credentials = oauth2client.client.SignedJwtAssertionCredentials(
              '012345678912-ThisIsARandomServiceAccountEmail@developer.gserviceaccount.com',
              'These are the contents of the p12 file that came with the service account',
              scope='https://www.googleapis.com/auth/devstorage.read_write')
@@ -125,18 +88,14 @@ class GCSClient(luigi.target.FileSystem):
       as the ``descriptor`` argument.
     """
     def __init__(self, oauth_credentials=None, descriptor='', http_=None,
-                 chunksize=CHUNKSIZE, **discovery_build_kwargs):
+                 chunksize=CHUNKSIZE):
         self.chunksize = chunksize
         authenticate_kwargs = gcp.get_authenticate_kwargs(oauth_credentials, http_)
 
-        build_kwargs = authenticate_kwargs.copy()
-        build_kwargs.update(discovery_build_kwargs)
-
         if descriptor:
-            self.client = discovery.build_from_document(descriptor, **build_kwargs)
+            self.client = discovery.build_from_document(descriptor, **authenticate_kwargs)
         else:
-            build_kwargs.setdefault('cache_discovery', False)
-            self.client = discovery.build('storage', 'v1', **build_kwargs)
+            self.client = discovery.build('storage', 'v1', **authenticate_kwargs)
 
     def _path_to_bucket_and_key(self, path):
         (scheme, netloc, path, _, _) = urlsplit(path)
@@ -150,10 +109,9 @@ class GCSClient(luigi.target.FileSystem):
     def _add_path_delimiter(self, key):
         return key if key[-1:] == '/' else key + '/'
 
-    @gcs_retry
     def _obj_exists(self, bucket, obj):
         try:
-            self.client.objects().get(bucket=bucket, object=obj).execute()
+            self.client.objects().get(bucket=bucket, object=obj).execute(num_retries=NUM_RETRIES)
         except errors.HttpError as ex:
             if ex.resp['status'] == '404':
                 return False
@@ -163,7 +121,7 @@ class GCSClient(luigi.target.FileSystem):
 
     def _list_iter(self, bucket, prefix):
         request = self.client.objects().list(bucket=bucket, prefix=prefix)
-        response = request.execute()
+        response = request.execute(num_retries=NUM_RETRIES)
 
         while response is not None:
             for it in response.get('items', []):
@@ -173,23 +131,39 @@ class GCSClient(luigi.target.FileSystem):
             if request is None:
                 break
 
-            response = request.execute()
+            response = request.execute(num_retries=NUM_RETRIES)
 
-    @gcs_retry
     def _do_put(self, media, dest_path):
         bucket, obj = self._path_to_bucket_and_key(dest_path)
 
         request = self.client.objects().insert(bucket=bucket, name=obj, media_body=media)
         if not media.resumable():
-            return request.execute()
+            return request.execute(num_retries=NUM_RETRIES)
 
         response = None
+        attempts = 0
         while response is None:
-            status, response = request.next_chunk()
-            if status:
-                logger.debug('Upload progress: %.2f%%', 100 * status.progress())
+            error = None
+            try:
+                status, response = request.next_chunk()
+                if status:
+                    logger.debug('Upload progress: %.2f%%', 100 * status.progress())
+            except errors.HttpError as err:
+                error = err
+                if err.resp.status < 500:
+                    raise
+                logger.warning('Caught error while uploading', exc_info=True)
+            except RETRYABLE_ERRORS as err:
+                logger.warning('Caught error while uploading', exc_info=True)
+                error = err
 
-        _wait_for_consistency(lambda: self._obj_exists(bucket, obj))
+            if error:
+                attempts += 1
+                if attempts >= NUM_RETRIES:
+                    raise error
+            else:
+                attempts = 0
+
         return response
 
     def exists(self, path):
@@ -203,7 +177,7 @@ class GCSClient(luigi.target.FileSystem):
         bucket, obj = self._path_to_bucket_and_key(path)
         if self._is_root(obj):
             try:
-                self.client.buckets().get(bucket=bucket).execute()
+                self.client.buckets().get(bucket=bucket).execute(num_retries=NUM_RETRIES)
             except errors.HttpError as ex:
                 if ex.resp['status'] == '404':
                     return False
@@ -214,7 +188,7 @@ class GCSClient(luigi.target.FileSystem):
             return True
 
         # Any objects with this prefix
-        resp = self.client.objects().list(bucket=bucket, prefix=obj, maxResults=20).execute()
+        resp = self.client.objects().list(bucket=bucket, prefix=obj, maxResults=20).execute(num_retries=NUM_RETRIES)
         lst = next(iter(resp.get('items', [])), None)
         return bool(lst)
 
@@ -225,70 +199,52 @@ class GCSClient(luigi.target.FileSystem):
             raise InvalidDeleteException(
                 'Cannot delete root of bucket at path {}'.format(path))
 
-        if self._obj_exists(bucket, obj):
-            self.client.objects().delete(bucket=bucket, object=obj).execute()
-            _wait_for_consistency(lambda: not self._obj_exists(bucket, obj))
-            return True
-
         if self.isdir(path):
-            if not recursive:
-                raise InvalidDeleteException(
-                    'Path {} is a directory. Must use recursive delete'.format(path))
+            return self.batch_remove(path, bucket, obj, recursive=recursive)
 
-            req = http.BatchHttpRequest(batch_uri=GCS_BATCH_URI)
-            for it in self._list_iter(bucket, self._add_path_delimiter(obj)):
-                req.add(self.client.objects().delete(bucket=bucket, object=it['name']))
-            req.execute()
-
-            _wait_for_consistency(lambda: not self.isdir(path))
+        if self._obj_exists(bucket, obj):
+            self.client.objects().delete(bucket=bucket, object=obj).execute(num_retries=NUM_RETRIES)
             return True
 
         return False
+
+    @retry_with_backoff_gcs
+    def batch_remove(self, path, bucket, obj, recursive=True):
+        """ Sub-method of remove() that is decorated with a backoff retry
+        BatchHttpRequest() object doesn't support num_retries argument, so workaround it
+        by using a custom backoff retry.
+        """
+        if not recursive:
+            raise InvalidDeleteException(
+                'Path {} is a directory. Must use recursive delete'.format(path))
+        objects = self._list_iter(bucket, self._add_path_delimiter(obj))
+
+        req = http.BatchHttpRequest()
+        for i, obj in enumerate(objects):
+            # Maximum batch request size is 1000
+            if (i + 1) % 1000 == 0:
+                req.execute()
+                req = http.BatchHttpRequest()
+            req.add(self.client.objects().delete(bucket=bucket, object=obj['name']))
+        req.execute()
+
+        return True
 
     def put(self, filename, dest_path, mimetype=None, chunksize=None):
         chunksize = chunksize or self.chunksize
         resumable = os.path.getsize(filename) > 0
 
         mimetype = mimetype or mimetypes.guess_type(dest_path)[0] or DEFAULT_MIMETYPE
-        media = http.MediaFileUpload(filename, mimetype=mimetype, chunksize=chunksize, resumable=resumable)
+        media = http.MediaFileUpload(filename, mimetype, chunksize=chunksize, resumable=resumable)
 
         self._do_put(media, dest_path)
 
-    def _forward_args_to_put(self, kwargs):
-        return self.put(**kwargs)
-
-    def put_multiple(self, filepaths, remote_directory, mimetype=None, chunksize=None, num_process=1):
-        if isinstance(filepaths, str):
-            raise ValueError(
-                'filenames must be a list of strings. If you want to put a single file, '
-                'use the `put(self, filename, ...)` method'
-            )
-
-        put_kwargs_list = [
-            {
-                'filename': filepath,
-                'dest_path': os.path.join(remote_directory, os.path.basename(filepath)),
-                'mimetype': mimetype,
-                'chunksize': chunksize,
-            }
-            for filepath in filepaths
-        ]
-
-        if num_process > 1:
-            from multiprocessing import Pool
-            from contextlib import closing
-            with closing(Pool(num_process)) as p:
-                return p.map(self._forward_args_to_put, put_kwargs_list)
-        else:
-            for put_kwargs in put_kwargs_list:
-                self._forward_args_to_put(put_kwargs)
-
     def put_string(self, contents, dest_path, mimetype=None):
         mimetype = mimetype or mimetypes.guess_type(dest_path)[0] or DEFAULT_MIMETYPE
-        assert isinstance(mimetype, str)
-        if not isinstance(contents, bytes):
+        assert isinstance(mimetype, six.string_types)
+        if not isinstance(contents, six.binary_type):
             contents = contents.encode("utf-8")
-        media = http.MediaIoBaseUpload(BytesIO(contents), mimetype, resumable=bool(contents))
+        media = http.MediaIoBaseUpload(six.BytesIO(contents), mimetype, resumable=bool(contents))
         self._do_put(media, dest_path)
 
     def mkdir(self, path, parents=True, raise_if_exists=False):
@@ -320,20 +276,16 @@ class GCSClient(luigi.target.FileSystem):
                     sourceObject=src_prefix + suffix,
                     destinationBucket=dest_bucket,
                     destinationObject=dest_prefix + suffix,
-                    body={}).execute()
+                    body={}).execute(num_retries=NUM_RETRIES)
                 copied_objs.append(dest_prefix + suffix)
 
-            _wait_for_consistency(
-                lambda: all(self._obj_exists(dest_bucket, obj)
-                            for obj in copied_objs))
         else:
             self.client.objects().copy(
                 sourceBucket=src_bucket,
                 sourceObject=src_obj,
                 destinationBucket=dest_bucket,
                 destinationObject=dest_obj,
-                body={}).execute()
-            _wait_for_consistency(lambda: self._obj_exists(dest_bucket, dest_obj))
+                body={}).execute(num_retries=NUM_RETRIES)
 
     def rename(self, *args, **kwargs):
         """
@@ -378,10 +330,9 @@ class GCSClient(luigi.target.FileSystem):
 
         for it in self.listdir(path):
             if it.startswith(path + '/' + wildcard_parts[0]) and it.endswith(wildcard_parts[1]) and \
-                   len(it) >= len(path + '/' + wildcard_parts[0]) + len(wildcard_parts[1]):
+                len(it) >= len(path + '/' + wildcard_parts[0]) + len(wildcard_parts[1]):
                 yield it
 
-    @gcs_retry
     def download(self, path, chunksize=None, chunk_callback=lambda _: False):
         """Downloads the object contents to local file system.
 
@@ -395,40 +346,38 @@ class GCSClient(luigi.target.FileSystem):
             return_fp = _DeleteOnCloseFile(fp.name, 'r')
 
             # Special case empty files because chunk-based downloading doesn't work.
-            result = self.client.objects().get(bucket=bucket, object=obj).execute()
+            result = self.client.objects().get(bucket=bucket, object=obj).execute(num_retries=NUM_RETRIES)
             if int(result['size']) == 0:
                 return return_fp
 
             request = self.client.objects().get_media(bucket=bucket, object=obj)
             downloader = http.MediaIoBaseDownload(fp, request, chunksize=chunksize)
 
+            attempts = 0
             done = False
             while not done:
-                _, done = downloader.next_chunk()
-                if chunk_callback(fp):
-                    done = True
+                error = None
+                try:
+                    _, done = downloader.next_chunk()
+                    if chunk_callback(fp):
+                        done = True
+                except errors.HttpError as err:
+                    error = err
+                    if err.resp.status < 500:
+                        raise
+                    logger.warning('Error downloading file, retrying', exc_info=True)
+                except RETRYABLE_ERRORS as err:
+                    logger.warning('Error downloading file, retrying', exc_info=True)
+                    error = err
+
+                if error:
+                    attempts += 1
+                    if attempts >= NUM_RETRIES:
+                        raise error
+                else:
+                    attempts = 0
 
         return return_fp
-
-
-class _DeleteOnCloseFile(io.FileIO):
-    def close(self):
-        super(_DeleteOnCloseFile, self).close()
-        try:
-            os.remove(self.name)
-        except OSError:
-            # Catch a potential threading race condition and also allow this
-            # method to be called multiple times.
-            pass
-
-    def readable(self):
-        return True
-
-    def writable(self):
-        return False
-
-    def seekable(self):
-        return True
 
 
 class AtomicGCSFile(luigi.target.AtomicLocalFile):
@@ -457,8 +406,7 @@ class GCSTarget(luigi.target.FileSystemTarget):
 
     def open(self, mode='r'):
         if mode == 'r':
-            return self.format.pipe_reader(
-                FileWrapper(io.BufferedReader(self.fs.download(self.path))))
+            return self.format.pipe_reader(self.fs.download(self.path))
         elif mode == 'w':
             return self.format.pipe_writer(AtomicGCSFile(self.path, self.fs))
         else:
